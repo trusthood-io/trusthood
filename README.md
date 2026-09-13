@@ -1,6 +1,6 @@
 # TrustHood Escrow
 
-**Trustless, milestone-based escrow on the Stellar blockchain.**
+**Trusthood, milestone-based escrow on the Stellar blockchain.**
 
 A platform where clients lock funds into verifiable smart contracts, contractors deliver work in provable milestones, and every outcome — completion or dispute — builds an immutable on-chain reputation that follows both parties forever.
 
