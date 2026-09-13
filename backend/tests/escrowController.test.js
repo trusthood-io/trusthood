@@ -1,0 +1,374 @@
+import { jest } from '@jest/globals';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const fixtures = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures/escrow.json'), 'utf8'));
+
+const cacheMock = {
+  get: jest.fn(),
+  set: jest.fn(),
+  invalidate: jest.fn(),
+  invalidatePrefix: jest.fn(),
+  invalidateTags: jest.fn(),
+  analytics: jest.fn(() => ({
+    hits: 0,
+    misses: 0,
+    sets: 0,
+    invalidations: 0,
+    hitRate: '0',
+    backend: 'memory',
+    memSize: 0,
+  })),
+  size: jest.fn(),
+};
+
+const prismaMock = {
+  $transaction: jest.fn(async (operations) => operations),
+  escrow: {
+    findMany: jest.fn(),
+    findUnique: jest.fn(),
+    count: jest.fn(),
+    upsert: jest.fn(),
+  },
+  milestone: {
+    findMany: jest.fn(),
+    findUnique: jest.fn(),
+    count: jest.fn(),
+  },
+};
+
+const submitTransactionMock = jest.fn();
+
+jest.unstable_mockModule('../lib/cache.js', () => ({ default: cacheMock }));
+jest.unstable_mockModule('../lib/prisma.js', () => ({ default: prismaMock }));
+jest.unstable_mockModule('../services/stellarService.js', () => ({
+  submitTransaction: submitTransactionMock,
+  getContractEvents: jest.fn(),
+  getLatestLedger: jest.fn(),
+}));
+jest.unstable_mockModule('@stellar/stellar-sdk', () => ({
+  xdr: {
+    ScVal: {
+      fromXDR: jest.fn(() => ({ type: 'u64', value: () => 42n })),
+    },
+  },
+  scValToNative: jest.fn(() => 42n),
+  SorobanRpc: {},
+  Transaction: jest.fn(),
+  Networks: { TESTNET: 'Test SDF Network ; September 2015', PUBLIC: 'Public Global Stellar Network ; September 2015' },
+}));
+
+const { default: escrowController } = await import('../api/controllers/escrowController.js');
+
+function createMockRes() {
+  const res = {
+    statusCode: 200,
+    body: null,
+    status: jest.fn().mockImplementation(function (code) {
+      this.statusCode = code;
+      return this;
+    }),
+    json: jest.fn().mockImplementation(function (payload) {
+      this.body = payload;
+      return this;
+    }),
+  };
+  return res;
+}
+
+beforeEach(() => {
+  jest.clearAllMocks();
+  cacheMock.get.mockReturnValue(null);
+  submitTransactionMock.mockResolvedValue({ hash: 'abc123', status: 'SUCCESS', returnValue: null });
+  prismaMock.escrow.upsert.mockResolvedValue({});
+  // Default prisma transaction behavior
+  prismaMock.$transaction.mockImplementation(async (ops) => {
+    return Promise.all(ops);
+  });
+  prismaMock.escrow.findMany.mockResolvedValue([]);
+  prismaMock.escrow.count.mockResolvedValue(0);
+});
+
+describe('escrowController', () => {
+  describe('listEscrows', () => {
+    it('returns 200 with paginated escrow list (cache miss)', async () => {
+      const req = { query: { page: '1', limit: '10' } };
+      const res = createMockRes();
+
+      prismaMock.escrow.findMany.mockResolvedValue(fixtures.escrows);
+      prismaMock.escrow.count.mockResolvedValue(fixtures.escrows.length);
+
+      await escrowController.listEscrows(req, res);
+
+      expect(res.json).toHaveBeenCalled();
+      expect(res.body.data).toHaveLength(fixtures.escrows.length);
+      expect(res.body.total).toBe(fixtures.escrows.length);
+    });
+
+    it('returns the normalized paginated response shape', async () => {
+      const req = { query: {} };
+      const res = createMockRes();
+
+      await escrowController.listEscrows(req, res);
+
+      expect(res.json).toHaveBeenCalledWith({
+        data: [],
+        page: 1,
+        limit: 20,
+        total: 0,
+        totalPages: 0,
+        hasNextPage: false,
+        hasPreviousPage: false,
+      });
+    });
+
+    it('applies status filter correctly', async () => {
+      const req = { query: { status: 'Active,Completed' } };
+      const res = createMockRes();
+
+      prismaMock.escrow.findMany.mockResolvedValue([]);
+      prismaMock.escrow.count.mockResolvedValue(0);
+
+      await escrowController.listEscrows(req, res);
+
+      expect(prismaMock.escrow.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            status: { in: ['Active', 'Completed'] },
+          }),
+        }),
+      );
+    });
+
+    it('applies search filter correctly (numeric ID)', async () => {
+      const req = { query: { search: '123' } };
+      const res = createMockRes();
+
+      await escrowController.listEscrows(req, res);
+
+      expect(prismaMock.escrow.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            OR: expect.arrayContaining([{ id: 123n }]),
+          }),
+        }),
+      );
+    });
+
+    it('applies amount range correctly', async () => {
+      const req = { query: { minAmount: '100', maxAmount: '500' } };
+      const res = createMockRes();
+
+      await escrowController.listEscrows(req, res);
+
+      expect(prismaMock.escrow.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            totalAmount: { gte: '100', lte: '500' },
+          }),
+        }),
+      );
+    });
+
+    it('returns 500 on error', async () => {
+      const req = { query: {} };
+      const res = createMockRes();
+      prismaMock.$transaction.mockRejectedValue(new Error('DB Error'));
+
+      await escrowController.listEscrows(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(500);
+      expect(res.body.error).toBe('DB Error');
+    });
+  });
+
+  describe('getEscrow', () => {
+    it('returns 200 with escrow details', async () => {
+      const req = { params: { id: '1' } };
+      const res = createMockRes();
+      const escrow = fixtures.escrows[0];
+      prismaMock.escrow.findUnique.mockResolvedValue(escrow);
+
+      await escrowController.getEscrow(req, res);
+
+      expect(res.json).toHaveBeenCalledWith(escrow);
+    });
+
+    it('returns 404 if escrow not found', async () => {
+      const req = { params: { id: '999' } };
+      const res = createMockRes();
+      prismaMock.escrow.findUnique.mockResolvedValue(null);
+
+      await escrowController.getEscrow(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(404);
+    });
+
+    it('returns 400 for invalid ID', async () => {
+      const req = { params: { id: 'abc' } };
+      const res = createMockRes();
+
+      await escrowController.getEscrow(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.body.error).toBe('Invalid escrow id');
+    });
+  });
+
+  describe('broadcastCreateEscrow', () => {
+    it('returns 400 if signedXdr is missing', async () => {
+      const req = { body: {} };
+      const res = createMockRes();
+
+      await escrowController.broadcastCreateEscrow(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+    });
+
+    it('returns 200 with { hash, escrowId } on SUCCESS', async () => {
+      submitTransactionMock.mockResolvedValue({ hash: 'tx_abc', status: 'SUCCESS', returnValue: null });
+      const req = { body: { signedXdr: 'AAAA...' } };
+      const res = createMockRes();
+
+      await escrowController.broadcastCreateEscrow(req, res);
+
+      expect(res.statusCode).toBe(200);
+      expect(res.body).toMatchObject({ hash: 'tx_abc' });
+    });
+
+    it('returns 422 on Soroban FAILED status', async () => {
+      submitTransactionMock.mockResolvedValue({ hash: 'tx_fail', status: 'FAILED', errorResultXdr: 'AAAA' });
+      const req = { body: { signedXdr: 'AAAA...' } };
+      const res = createMockRes();
+
+      await escrowController.broadcastCreateEscrow(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(422);
+      expect(res.body.sorobanStatus).toBe('FAILED');
+    });
+
+    it('returns 422 on TIMEOUT', async () => {
+      submitTransactionMock.mockResolvedValue({ hash: 'tx_timeout', status: 'TIMEOUT' });
+      const req = { body: { signedXdr: 'AAAA...' } };
+      const res = createMockRes();
+
+      await escrowController.broadcastCreateEscrow(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(422);
+    });
+  });
+
+  describe('getMilestones', () => {
+    it('returns 200 with milestones', async () => {
+      const req = { params: { id: '1' }, query: {} };
+      const res = createMockRes();
+      prismaMock.milestone.findMany.mockResolvedValue(fixtures.milestones);
+      prismaMock.milestone.count.mockResolvedValue(fixtures.milestones.length);
+
+      await escrowController.getMilestones(req, res);
+
+      expect(res.json).toHaveBeenCalled();
+      expect(res.body.data).toHaveLength(fixtures.milestones.length);
+    });
+
+    it('returns 400 for invalid escrow ID', async () => {
+      const req = { params: { id: 'abc' }, query: {} };
+      const res = createMockRes();
+
+      await escrowController.getMilestones(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+    });
+  });
+
+  describe('getMilestone', () => {
+    it('returns 200 with specific milestone', async () => {
+      const req = { params: { id: '1', milestoneId: '0' } };
+      const res = createMockRes();
+      prismaMock.milestone.findUnique.mockResolvedValue(fixtures.milestones[0]);
+
+      await escrowController.getMilestone(req, res);
+
+      expect(res.json).toHaveBeenCalledWith(fixtures.milestones[0]);
+    });
+
+    it('returns 404 if milestone not found', async () => {
+      const req = { params: { id: '1', milestoneId: '99' } };
+      const res = createMockRes();
+      prismaMock.milestone.findUnique.mockResolvedValue(null);
+
+      await escrowController.getMilestone(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(404);
+    });
+  });
+});
+
+// ── Cache hit / miss / invalidation tests ─────────────────────────────────────
+
+describe('escrowController — cache behaviour', () => {
+  describe('onEscrowStatusChange', () => {
+    it('invalidates escrow:{id} and escrows tags', async () => {
+      cacheMock.invalidateTags.mockResolvedValue(undefined);
+
+      await escrowController.onEscrowStatusChange('42');
+
+      expect(cacheMock.invalidateTags).toHaveBeenCalledWith(['escrows', 'escrow:42']);
+    });
+
+    it('logs cache metrics after invalidation', async () => {
+      const consoleSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+      cacheMock.invalidateTags.mockResolvedValue(undefined);
+
+      await escrowController.onEscrowStatusChange('7');
+
+      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('[Cache]'));
+      consoleSpy.mockRestore();
+    });
+
+    it('does not throw when invalidateTags rejects (graceful fallback)', async () => {
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      cacheMock.invalidateTags.mockRejectedValue(new Error('Redis unavailable'));
+
+      await expect(escrowController.onEscrowStatusChange('99')).resolves.toBeUndefined();
+
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('[Cache] invalidateEscrowCache failed:'),
+        'Redis unavailable',
+      );
+      consoleErrorSpy.mockRestore();
+    });
+  });
+
+  describe('listEscrows — cache miss falls through to DB', () => {
+    it('queries DB and returns data when cache is cold', async () => {
+      const req = { query: { page: '1', limit: '5' } };
+      const res = createMockRes();
+
+      prismaMock.escrow.findMany.mockResolvedValue(fixtures.escrows);
+      prismaMock.escrow.count.mockResolvedValue(fixtures.escrows.length);
+
+      await escrowController.listEscrows(req, res);
+
+      expect(prismaMock.escrow.findMany).toHaveBeenCalled();
+      expect(res.body.data).toHaveLength(fixtures.escrows.length);
+    });
+  });
+
+  describe('getEscrow — cache miss falls through to DB', () => {
+    it('queries DB and returns escrow when cache is cold', async () => {
+      const req = { params: { id: '1' } };
+      const res = createMockRes();
+      prismaMock.escrow.findUnique.mockResolvedValue(fixtures.escrows[0]);
+
+      await escrowController.getEscrow(req, res);
+
+      expect(prismaMock.escrow.findUnique).toHaveBeenCalled();
+      expect(res.json).toHaveBeenCalledWith(fixtures.escrows[0]);
+    });
+  });
+});

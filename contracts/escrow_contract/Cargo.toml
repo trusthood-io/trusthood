@@ -1,0 +1,18 @@
+[package]
+name = "trusthood-escrow-contract"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Milestone-based escrow contract with on-chain reputation — TrustHoodEscrow"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { version = "21.0.0", features = [] }
+trusthood-shared = { path = "../shared" }
+
+[dev-dependencies]
+criterion = "0.4"
+ed25519-dalek = "2.2.0"
+soroban-sdk = { version = "21.0.0", features = ["testutils"] }
